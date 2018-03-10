@@ -31,7 +31,7 @@
 #include <net/pkt_sched.h>
 #include <net/inet_ecn.h>
 
-#define QUEUE_THRESHOLD 10000
+#define QUEUE_THRESHOLD 16384   /* 16KB i.e. 2^14 */
 #define DQCOUNT_INVALID -1
 #define MAX_PROB  0xffffffff
 #define PIE_SCALE 8
@@ -57,6 +57,8 @@ struct pie_vars {
 	psched_time_t dq_tstamp;	/* drain rate */
 	u32 avg_dq_rate;	/* bytes per pschedtime tick,scaled */
 	u32 qlen_old;		/* in bytes */
+	bool active; 		/* active/inactive */
+	u64 accu_prob;		/* accumulated probability */
 };
 
 /* statistics gathering */
@@ -80,9 +82,9 @@ static void pie_params_init(struct pie_params *params)
 {
 	params->alpha = 2;
 	params->beta = 20;
-	params->tupdate = usecs_to_jiffies(30 * USEC_PER_MSEC);	/* 30 ms */
+	params->tupdate = usecs_to_jiffies(15 * USEC_PER_MSEC);	/* 15 ms */
 	params->limit = 1000;	/* default of 1000 packets */
-	params->target = PSCHED_NS2TICKS(20 * NSEC_PER_MSEC);	/* 20 ms */
+	params->target = PSCHED_NS2TICKS(15 * NSEC_PER_MSEC);	/* 15 ms */
 	params->ecn = false;
 	params->bytemode = false;
 }
@@ -91,8 +93,10 @@ static void pie_vars_init(struct pie_vars *vars)
 {
 	vars->dq_count = DQCOUNT_INVALID;
 	vars->avg_dq_rate = 0;
-	/* default of 100 ms in pschedtime */
-	vars->burst_time = PSCHED_NS2TICKS(100 * NSEC_PER_MSEC);
+	/* default of 150 ms in pschedtime */
+	vars->burst_time = PSCHED_NS2TICKS(150 * NSEC_PER_MSEC);
+	vars->active = true;
+	vars->accu_prob = 0;
 }
 
 static bool drop_early(struct Qdisc *sch, u32 packet_size)
@@ -127,10 +131,22 @@ static bool drop_early(struct Qdisc *sch, u32 packet_size)
 	else
 		local_prob = q->vars.prob;
 
-	rnd = prandom_u32();
-	if (rnd < local_prob)
+	if (local_prob == 0)
+		q->vars.accu_prob = 0;
+
+	q->vars.accu_prob += local_prob;
+
+	if (q->vars.accu_prob < (MAX_PROB / 100) * 85)
+		return false;
+	if (q->vars.accu_prob >= ((u64)MAX_PROB * 17) / 2)
 		return true;
 
+	rnd = prandom_u32();
+	if (rnd < local_prob) {
+		q->vars.accu_prob = 0;
+		return true;
+	}
+		
 	return false;
 }
 
@@ -140,12 +156,29 @@ static int pie_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	struct pie_sched_data *q = qdisc_priv(sch);
 	bool enqueue = false;
 
+	if (!q->vars.active && 
+			qdisc_qlen(sch) >= sch->limit / 3) {
+		/* If queue is over certain threshold,
+		 * turn on PIE.
+		 */
+		pie_vars_init(&q->vars);
+		q->vars.qdelay_old = 0;
+		q->vars.prob = 0;
+		q->vars.dq_count = 0;
+		q->vars.dq_tstamp = psched_get_time();
+	}
+
 	if (unlikely(qdisc_qlen(sch) >= sch->limit)) {
 		q->stats.overlimit++;
 		goto out;
 	}
 
-	if (!drop_early(sch, skb->len)) {
+	if (!q->vars.active) {
+		/* If PIE is inactive
+		 * do not drop
+		 */
+		enqueue = true;
+	} else if (!drop_early(sch, skb->len)) {
 		enqueue = true;
 	} else if (q->params.ecn && (q->vars.prob <= MAX_PROB / 10) &&
 		   INET_ECN_set_ce(skb)) {
@@ -167,6 +200,7 @@ static int pie_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 
 out:
 	q->stats.dropped++;
+	q->vars.accu_prob = 0;
 	return qdisc_drop(skb, sch, to_free);
 }
 
@@ -283,9 +317,13 @@ static void pie_process_dequeue(struct Qdisc *sch, struct sk_buff *skb)
 			if (q->vars.avg_dq_rate == 0)
 				q->vars.avg_dq_rate = count;
 			else
+				/* weight = DQ_THRESHOLD / 2^16
+				 *        = 2^14 / 2^16
+				 *        = 1 / 4
+				 */
 				q->vars.avg_dq_rate =
 				    (q->vars.avg_dq_rate -
-				     (q->vars.avg_dq_rate >> 3)) + (count >> 3);
+				     (q->vars.avg_dq_rate >> 2)) + (count >> 2);
 
 			/* If the queue has receded below the threshold, we hold
 			 * on to the last drain rate calculated, else we reset
@@ -344,7 +382,27 @@ static void calculate_probability(struct Qdisc *sch)
 	 * We scale alpha and beta differently depending on whether we are in
 	 * light, medium or high dropping mode.
 	 */
-	if (q->vars.prob < MAX_PROB / 100) {
+	if (q->vars.prob < MAX_PROB / 1000000) {
+		alpha =
+		    (q->params.alpha * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 15;
+		beta =
+		    (q->params.beta * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 15;
+	} else if (q->vars.prob < MAX_PROB / 100000) {
+		alpha =
+		    (q->params.alpha * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 13;
+		beta =
+		    (q->params.beta * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 13;
+	} else if (q->vars.prob < MAX_PROB / 10000) {
+		alpha =
+		    (q->params.alpha * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 11;
+		beta =
+		    (q->params.beta * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 11;
+	} else if (q->vars.prob < MAX_PROB / 1000) {
+		alpha =
+		    (q->params.alpha * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 9;
+		beta =
+		    (q->params.beta * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 9;
+	} else if (q->vars.prob < MAX_PROB / 100) {
 		alpha =
 		    (q->params.alpha * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 7;
 		beta =
@@ -418,8 +476,11 @@ static void calculate_probability(struct Qdisc *sch)
 	if ((q->vars.qdelay < q->params.target / 2) &&
 	    (q->vars.qdelay_old < q->params.target / 2) &&
 	    (q->vars.prob == 0) &&
-	    (q->vars.avg_dq_rate > 0))
+	    (q->vars.avg_dq_rate > 0)) {
 		pie_vars_init(&q->vars);
+		/* Turn off PIE */
+		q->vars.active = false;
+	}
 }
 
 static void pie_timer(unsigned long arg)
@@ -429,7 +490,8 @@ static void pie_timer(unsigned long arg)
 	spinlock_t *root_lock = qdisc_lock(qdisc_root_sleeping(sch));
 
 	spin_lock(root_lock);
-	calculate_probability(sch);
+	if (q->vars.active)
+		calculate_probability(sch);
 
 	/* reset the timer to fire after 'tupdate'. tupdate is in jiffies. */
 	if (q->params.tupdate)
