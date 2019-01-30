@@ -360,6 +360,7 @@ static void calculate_probability(struct Qdisc *sch)
 	u32 oldprob;
 	u32 alpha, beta;
 	bool update_prob = true;
+	u32 power;
 
 	q->vars.qdelay_old = q->vars.qdelay;
 
@@ -385,6 +386,21 @@ static void calculate_probability(struct Qdisc *sch)
 	 * We scale alpha and beta differently depending on whether we are in
 	 * light, medium or high dropping mode.
 	 */
+	alpha = (q->params.alpha * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 4;
+	beta = (q->params.beta * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 4;
+
+	if (q->vars.prob < MAX_PROB / 10) {
+		alpha = alpha >> 1;
+		beta = beta >> 1;
+
+		power = 100;
+		while(q->vars.prob < MAX_PROB / power && power < 10000000) {
+			alpha = alpha >> 2;
+			beta = beta >> 2;
+			power = power * 10;
+		}
+	}
+/*
 	if (q->vars.prob < MAX_PROB / 1000000) {
 		alpha =
 		    (q->params.alpha * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 15;
@@ -421,6 +437,7 @@ static void calculate_probability(struct Qdisc *sch)
 		beta =
 		    (q->params.beta * (MAX_PROB / PSCHED_TICKS_PER_SEC)) >> 4;
 	}
+*/
 
 	/* alpha and beta should be between 0 and 32, in multiples of 1/16 */
 	delta += alpha * ((qdelay - q->params.target));
